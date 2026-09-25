@@ -61,6 +61,11 @@ BASE_MAX_RANGE_PCT = 0.15    # (maxH - minL) / minL over base window
 EXT_MAX = 1.15               # prior close / 20d min close, above this = extended
 NR_LOOKBACK = 7              # NR7 check on prior day
 
+# EMA crossover strategy (separate section on the dashboard)
+EMA_FAST = 20
+EMA_SLOW = 100
+EMA_MIN_BARS = 110           # trading days needed before the cross counts
+
 SPARK_DAYS = 30              # closes shown in sparkline
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -173,7 +178,7 @@ def load_panel(days: int) -> pd.DataFrame:
 # ----------------------------- synthetic mode -----------------------------
 
 
-def synthetic_panel(n_symbols=60, n_days=100, seed=7) -> pd.DataFrame:
+def synthetic_panel(n_symbols=60, n_days=130, seed=7) -> pd.DataFrame:
     """Offline demo data. A subset of symbols gets a planted breakout today."""
     rng = random.Random(seed)
     rows = []
@@ -309,6 +314,48 @@ def run_scan(panel: pd.DataFrame) -> tuple[list[dict], str]:
     return results, latest.strftime("%d %b %Y")
 
 
+def run_ema_cross(panel: pd.DataFrame) -> list[dict]:
+    """EMA 20 crossed above EMA 100 today (daily closes). Separate strategy."""
+    latest = panel["date"].max()
+    out = []
+    for sym, g in panel.groupby("symbol", sort=False):
+        g = g.sort_values("date").reset_index(drop=True)
+        if len(g) < EMA_MIN_BARS or g.iloc[-1]["date"] != latest:
+            continue
+        t = g.iloc[-1]
+        c = float(t["close"])
+        v = float(t["volume"])
+        turnover_cr = float(t.get("turnover", c * v)) / 1e7
+        if c < MIN_CLOSE or turnover_cr < MIN_TURNOVER_CR:
+            continue
+
+        closes = g["close"].astype(float)
+        e_fast = closes.ewm(span=EMA_FAST, adjust=False).mean()
+        e_slow = closes.ewm(span=EMA_SLOW, adjust=False).mean()
+        # the cross: below or equal yesterday, above today
+        if not (e_fast.iloc[-2] <= e_slow.iloc[-2] and
+                e_fast.iloc[-1] > e_slow.iloc[-1]):
+            continue
+
+        vol20 = g["volume"].iloc[-21:-1].mean()
+        ret20 = (c / float(closes.iloc[-21]) - 1) * 100 if len(g) >= 21 else 0
+        out.append(dict(
+            symbol=sym,
+            close=round(c, 2),
+            pct=round((c / float(g.iloc[-2]["close"]) - 1) * 100, 2),
+            ema_fast=round(float(e_fast.iloc[-1]), 2),
+            ema_slow=round(float(e_slow.iloc[-1]), 2),
+            gap_pct=round((float(e_fast.iloc[-1]) / float(e_slow.iloc[-1]) - 1)
+                          * 100, 2),
+            vol_x=round(v / vol20, 2) if vol20 > 0 else 0,
+            turnover_cr=round(turnover_cr, 1),
+            ret20=round(ret20, 1),
+            spark=[round(float(x), 2) for x in closes.iloc[-SPARK_DAYS:]],
+        ))
+    out.sort(key=lambda r: (-r["vol_x"], -r["turnover_cr"]))
+    return out
+
+
 # ----------------------------- dashboard -----------------------------
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -424,6 +471,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <tbody></tbody>
   </table>
 
+  <h2>EMA 20 × 100 crossover <span class="count" id="ema-count"></span></h2>
+  <div class="scan-def mono" style="margin:-4px 0 12px">
+    Daily EMA(close, 20) crossed above Daily EMA(close, 100) today ·
+    trend entry, not a burst — manage on the slow EMA, not the burst playbook below
+  </div>
+  <table id="ema-table">
+    <thead><tr>
+      <th>Symbol</th><th>Close</th><th>%Chg</th><th>EMA 20</th><th>EMA 100</th>
+      <th>Gap</th><th>Vol vs 20d</th><th>₹ cr</th><th>20d ret</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  <div class="empty" id="ema-empty" hidden>No stock crossed EMA 20 above EMA 100 today.</div>
+
   <div class="rules">
     <h3>Trade management playbook</h3>
     <ol>
@@ -442,6 +503,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <script>
 const DATA = __DATA_JSON__;
+const EMA_DATA = __EMA_JSON__;
 
 function fmt(n){ return n.toLocaleString('en-IN'); }
 
@@ -523,22 +585,38 @@ tb.innerHTML = DATA.map(r=>`<tr>
   <td><b>${r.score}</b>/4</td></tr>`).join('');
 document.getElementById('all-count').textContent = DATA.length;
 document.getElementById('hdr-counts').textContent =
-  DATA.length+' hits · '+aplus.length+' A+';
+  DATA.length+' hits · '+aplus.length+' A+ · '+EMA_DATA.length+' EMA cross';
+
+const etb=document.querySelector('#ema-table tbody');
+etb.innerHTML = EMA_DATA.map(r=>`<tr>
+  <td class="sy">${r.symbol}</td><td>${r.close.toFixed(2)}</td>
+  <td class="${r.pct>=0?'up':''}">${r.pct>=0?'+':''}${r.pct.toFixed(1)}%</td>
+  <td>${r.ema_fast.toFixed(2)}</td><td>${r.ema_slow.toFixed(2)}</td>
+  <td>+${r.gap_pct.toFixed(2)}%</td><td>${r.vol_x.toFixed(1)}×</td>
+  <td>${r.turnover_cr}</td><td>${r.ret20>=0?'+':''}${r.ret20.toFixed(1)}%</td>
+</tr>`).join('');
+document.getElementById('ema-count').textContent = EMA_DATA.length;
+if(!EMA_DATA.length){
+  document.getElementById('ema-table').hidden=true;
+  document.getElementById('ema-empty').hidden=false;
+}
 </script>
 </body>
 </html>
 """
 
 
-def write_dashboard(results, scan_date, out_path):
+def write_dashboard(results, ema_results, scan_date, out_path):
     html = (HTML_TEMPLATE
             .replace("__SCAN_DATE__", scan_date)
             .replace("__MIN_TURNOVER__", str(int(MIN_TURNOVER_CR)))
-            .replace("__DATA_JSON__", json.dumps(results)))
+            .replace("__DATA_JSON__", json.dumps(results))
+            .replace("__EMA_JSON__", json.dumps(ema_results)))
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"Dashboard written: {out_path} "
-          f"({len(results)} hits, {sum(r['score'] == 4 for r in results)} A+)")
+          f"({len(results)} hits, {sum(r['score'] == 4 for r in results)} A+, "
+          f"{len(ema_results)} EMA crosses)")
 
 
 # ----------------------------- main -----------------------------
@@ -546,8 +624,9 @@ def write_dashboard(results, scan_date, out_path):
 
 def main():
     ap = argparse.ArgumentParser(description="NSE 4% momentum burst scanner")
-    ap.add_argument("--days", type=int, default=120,
-                    help="calendar days of history to load (default 120)")
+    ap.add_argument("--days", type=int, default=250,
+                    help="calendar days of history to load (default 250; "
+                         "the EMA 100 needs the longer window)")
     ap.add_argument("--out", default="dashboard.html")
     ap.add_argument("--synthetic", action="store_true",
                     help="offline demo with generated data")
@@ -560,7 +639,8 @@ def main():
         panel = load_panel(args.days)
 
     results, scan_date = run_scan(panel)
-    write_dashboard(results, scan_date, args.out)
+    ema_results = run_ema_cross(panel)
+    write_dashboard(results, ema_results, scan_date, args.out)
 
 
 if __name__ == "__main__":
