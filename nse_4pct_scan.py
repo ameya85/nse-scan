@@ -51,6 +51,9 @@ MISS_MIN_AGE_DAYS = 2
 # Bump this to clear stale "no data" markers from an existing cache. Downloaded
 # price data is kept; only the markers are dropped.
 MISS_MARKER_VERSION = 2
+# A real NSE session has well over a thousand EQ symbols trading. Anything
+# below this means the exchange was shut and the file is a carry-forward.
+MIN_TRADED_SYMBOLS = 50
 
 # Core Stockbee rule
 MIN_GAIN = 1.04          # c/c1
@@ -88,13 +91,26 @@ def _session():
     return s
 
 
+def _traded(df) -> bool:
+    """True only if the exchange actually traded that day. On a holiday NSE can
+    still serve a file carrying the previous session's prices at zero volume;
+    accepting it would add a flat duplicate bar to every stock."""
+    if df is None or df.empty or "volume" not in df:
+        return False
+    vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+    return int((vol > 0).sum()) >= MIN_TRADED_SYMBOLS
+
+
 def fetch_day(sess, d: date) -> pd.DataFrame | None:
     """Return one day's EQ-series OHLCV for all symbols, or None (holiday)."""
     tag = d.strftime("%Y%m%d")
     cache = os.path.join(CACHE_DIR, f"bhav_{tag}.parquet")
     miss = os.path.join(CACHE_DIR, f"bhav_{tag}.miss")
     if os.path.exists(cache):
-        return pd.read_parquet(cache)
+        cached = pd.read_parquet(cache)
+        if _traded(cached):
+            return cached
+        os.remove(cache)        # carry-forward file from a shut exchange
     if os.path.exists(miss):
         return None
 
@@ -141,7 +157,7 @@ def fetch_day(sess, d: date) -> pd.DataFrame | None:
         except Exception:
             df = None
 
-    if df is None or df.empty:
+    if not _traded(df):
         # Only mark a day as permanently empty once it is old enough that the
         # data was never going to arrive (a holiday). A recent day with no file
         # is usually just "not published yet", so leave it to be retried.
