@@ -44,6 +44,13 @@ import requests
 # ----------------------------- configuration -----------------------------
 
 CACHE_DIR = "nse_cache"
+# A day with no bhavcopy is only treated as a permanent holiday once it is this
+# many days old. Younger days are retried, so a morning run that looks before
+# NSE has published cannot freeze that date out of the dataset.
+MISS_MIN_AGE_DAYS = 2
+# Bump this to clear stale "no data" markers from an existing cache. Downloaded
+# price data is kept; only the markers are dropped.
+MISS_MARKER_VERSION = 2
 
 # Core Stockbee rule
 MIN_GAIN = 1.04          # c/c1
@@ -135,7 +142,11 @@ def fetch_day(sess, d: date) -> pd.DataFrame | None:
             df = None
 
     if df is None or df.empty:
-        open(miss, "w").close()
+        # Only mark a day as permanently empty once it is old enough that the
+        # data was never going to arrive (a holiday). A recent day with no file
+        # is usually just "not published yet", so leave it to be retried.
+        if (date.today() - d).days >= MISS_MIN_AGE_DAYS:
+            open(miss, "w").close()
         return None
 
     df["date"] = pd.Timestamp(d)
@@ -144,8 +155,32 @@ def fetch_day(sess, d: date) -> pd.DataFrame | None:
     return df
 
 
+def clear_stale_misses():
+    """Drop 'no data' markers written by an older version of this script.
+    Price files are untouched, so nothing already downloaded is re-fetched."""
+    stamp = os.path.join(CACHE_DIR, "miss_version")
+    current = None
+    if os.path.exists(stamp):
+        try:
+            current = int(open(stamp).read().strip())
+        except Exception:
+            current = None
+    if current == MISS_MARKER_VERSION:
+        return
+    dropped = 0
+    for name in os.listdir(CACHE_DIR):
+        if name.endswith(".miss"):
+            os.remove(os.path.join(CACHE_DIR, name))
+            dropped += 1
+    with open(stamp, "w") as f:
+        f.write(str(MISS_MARKER_VERSION))
+    if dropped:
+        print(f"Cleared {dropped} stale no-data markers; those days will be retried")
+
+
 def load_panel(days: int) -> pd.DataFrame:
     os.makedirs(CACHE_DIR, exist_ok=True)
+    clear_stale_misses()
     sess = _session()
     # Warm cookies once; archives usually accept a plain UA but this helps.
     try:
