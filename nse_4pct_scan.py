@@ -91,6 +91,21 @@ def _session():
     return s
 
 
+def _file_is_for(raw, cols, d: date) -> bool:
+    """On a holiday NSE can serve the previous session's file under today's
+    URL. Every bhavcopy carries its own trade date, so check that first."""
+    for col in cols:
+        if col not in raw.columns:
+            continue
+        s = raw[col].astype(str).str.strip()
+        for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y", None):
+            got = (pd.to_datetime(s, format=fmt, errors="coerce") if fmt
+                   else pd.to_datetime(s, errors="coerce", dayfirst=True)).dropna()
+            if len(got) >= 0.9 * len(s) and not got.empty:
+                return bool((got.dt.date == d).mean() > 0.9)
+    return True     # no readable date column to check against
+
+
 def _traded(df) -> bool:
     """True only if the exchange actually traded that day. On a holiday NSE can
     still serve a file carrying the previous session's prices at zero volume;
@@ -123,6 +138,8 @@ def fetch_day(sess, d: date) -> pd.DataFrame | None:
         if r.status_code == 200 and r.content[:2] == b"PK":
             with zipfile.ZipFile(io.BytesIO(r.content)) as z:
                 raw = pd.read_csv(z.open(z.namelist()[0]))
+            if not _file_is_for(raw, ("TradDt", "BizDt"), d):
+                raise ValueError("file holds another session")
             raw = raw[raw["SctySrs"].astype(str).str.strip() == "EQ"]
             df = pd.DataFrame({
                 "symbol": raw["TckrSymb"].astype(str).str.strip(),
@@ -143,6 +160,8 @@ def fetch_day(sess, d: date) -> pd.DataFrame | None:
             if r.status_code == 200 and b"SYMBOL" in r.content[:200]:
                 raw = pd.read_csv(io.BytesIO(r.content))
                 raw.columns = [c.strip() for c in raw.columns]
+                if not _file_is_for(raw, ("DATE1", "DATE"), d):
+                    raise ValueError("file holds another session")
                 raw = raw[raw["SERIES"].astype(str).str.strip() == "EQ"]
                 df = pd.DataFrame({
                     "symbol": raw["SYMBOL"].astype(str).str.strip(),
@@ -221,9 +240,37 @@ def load_panel(days: int) -> pd.DataFrame:
         sys.exit("No bhavcopy data retrieved. Check network or run --synthetic.")
     panel = pd.concat(frames, ignore_index=True)
     panel = panel.sort_values(["symbol", "date"]).reset_index(drop=True)
+    panel = drop_repeat_sessions(panel)
     print(f"Panel: {panel['symbol'].nunique()} symbols, "
           f"{panel['date'].nunique()} trading days")
     return panel
+
+
+def drop_repeat_sessions(panel: pd.DataFrame) -> pd.DataFrame:
+    """Remove a day whose closes just repeat the previous session. Catches a
+    holiday file already sitting in the cache from an earlier version, which
+    carries the right date label but the wrong session's prices."""
+    dates = sorted(panel["date"].unique())
+    closes = {d: panel[panel["date"] == d].set_index("symbol")["close"]
+              for d in dates}
+    drop, prev = [], None
+    for d in dates:
+        cur = closes[d]
+        if prev is not None:
+            both = cur.index.intersection(prev.index)
+            if len(both) > 200 and (cur[both].values == prev[both].values).mean() > 0.95:
+                drop.append(d)
+                continue        # compare the next day to the last real session
+        prev = cur
+    for d in drop:
+        day = pd.Timestamp(d).date()
+        stamp = os.path.join(CACHE_DIR, f"bhav_{day.strftime('%Y%m%d')}")
+        if os.path.exists(stamp + ".parquet"):
+            os.remove(stamp + ".parquet")
+        if (date.today() - day).days >= MISS_MIN_AGE_DAYS:
+            open(stamp + ".miss", "w").close()
+        print(f"Dropped {day}: closes repeat the previous session (exchange shut)")
+    return panel[~panel["date"].isin(drop)] if drop else panel
 
 
 # ----------------------------- synthetic mode -----------------------------
